@@ -17,6 +17,9 @@
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
   Modified 2012 by Todd Krein (todd@krein.org) to implement repeated starts
+  Modified 2015 by Kai-Uwe Mildenberger (mildenberger@techsoftnet.ch) www.techsoftnet.ch
+    to fix combined master / slave usage (remaining issue: default initialized as slave 127)
+    also see the issue 'I2C/TWI/Wire Multi-master Arbitration Fix #1313'
 */
 
 #include <math.h>
@@ -25,7 +28,7 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <compat/twi.h>
-#include "Arduino.h" // for digitalWrite
+#include "Arduino.h" // for digitalWrite and delayMicroseconds
 
 #ifndef cbi
 #define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
@@ -68,7 +71,6 @@ static volatile uint8_t twi_error;
 void twi_init(void)
 {
   // initialize state
-  twi_state = TWI_READY;
   twi_sendStop = true;		// default value
   twi_inRepStart = false;
   
@@ -87,7 +89,7 @@ void twi_init(void)
   It is 72 for a 16mhz Wiring board with 100kHz TWI */
 
   // enable twi module, acks, and twi interrupt
-  TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA);
+  twi_releaseBus(); // more efficient - int flag is initially cleared anyway
 }
 
 /* 
@@ -101,6 +103,53 @@ void twi_setAddress(uint8_t address)
   // set twi slave address (skip over TWGCE bit)
   TWAR = address << 1;
 }
+
+/* 
+ * Function twi_wait
+ * Desc     helper routine to handle wait at begin and end of a transmission
+ *          and doing a twi reset if necessary
+ * Input    begin: indicates the begin of a transmission
+ *          state: state indicating the actual transmission
+ *          timeout: transmission timeout in us
+ * Output   true:  ok
+ *          false: timeout occured
+ */
+uint8_t twi_wait(uint8_t begin, uint8_t state, uint32_t timeout)
+{
+  do{
+    if(true == begin){
+      cli();
+      if(TWI_READY == twi_state){
+        twi_state = state;
+        return true;
+      }
+      sei();
+    }
+	else if(state != twi_state){
+      return true;
+	}
+    delayMicroseconds(1);
+  }
+  while(--timeout>0);
+  // twi reset
+  TWCR = _BV(TWEN); // disable int!
+  twi_stop();
+  twi_error = TW_BUS_ERROR;
+  return false;
+}
+
+// This needs some discussion:
+// With two ATMega168 talking permanent together both as master and slave
+// the approach is working very well.
+// But if you e.g. have some disturbance on the lines the twi can get blocked.
+// To get a 100% reliable system a timeout check has to be added.
+// Another possibility is to use the watchdog with a routine to reset the twi.
+// The time needed for 'start+address+32*data+stop' follows the rule:
+// transmission time in us = (1+9+32*9+1) * 1000000L / TWI_FREQ
+// Additionally a slave can stretch the transmission, that's completely undefined.
+// So some user definable timeout has to be added maybe as a parameter of twi_init.
+// For now we use that:
+#define TRANSMIT_TIMEOUT_US (2*308L*1000000L/TWI_FREQ)  /* about 6ms at 100kHz */
 
 /* 
  * Function twi_readFrom
@@ -122,10 +171,10 @@ uint8_t twi_readFrom(uint8_t address, uint8_t* data, uint8_t length, uint8_t sen
   }
 
   // wait until twi is ready, become master receiver
-  while(TWI_READY != twi_state){
-    continue;
+  if (!twi_wait(true, TWI_MRX, TRANSMIT_TIMEOUT_US)){
+    return 0;
   }
-  twi_state = TWI_MRX;
+
   twi_sendStop = sendStop;
   // reset error state (0xFF.. no error occured)
   twi_error = 0xFF;
@@ -135,7 +184,7 @@ uint8_t twi_readFrom(uint8_t address, uint8_t* data, uint8_t length, uint8_t sen
   twi_masterBufferLength = length-1;  // This is not intuitive, read on...
   // On receive, the previously configured ACK/NACK setting is transmitted in
   // response to the received byte before the interrupt is signalled. 
-  // Therefor we must actually set NACK when the _next_ to last byte is
+  // Therefore we must actually set NACK when the _next_ to last byte is
   // received, causing that NACK to be sent in response to receiving the last
   // expected byte of data.
 
@@ -156,12 +205,13 @@ uint8_t twi_readFrom(uint8_t address, uint8_t* data, uint8_t length, uint8_t sen
   }
   else
     // send start condition
-    TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT) | _BV(TWSTA);
+    // don't reset int flag, int may already be pending!
+    TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) /*| _BV(TWINT)*/ | _BV(TWSTA);
+
+  sei();
 
   // wait for read operation to complete
-  while(TWI_MRX == twi_state){
-    continue;
-  }
+  twi_wait(false, TWI_MRX, TRANSMIT_TIMEOUT_US);
 
   if (twi_masterBufferIndex < length)
     length = twi_masterBufferIndex;
@@ -199,10 +249,10 @@ uint8_t twi_writeTo(uint8_t address, uint8_t* data, uint8_t length, uint8_t wait
   }
 
   // wait until twi is ready, become master transmitter
-  while(TWI_READY != twi_state){
-    continue;
+  if (!twi_wait(true, TWI_MTX, TRANSMIT_TIMEOUT_US)){
+    return 4;
   }
-  twi_state = TWI_MTX;
+
   twi_sendStop = sendStop;
   // reset error state (0xFF.. no error occured)
   twi_error = 0xFF;
@@ -236,13 +286,15 @@ uint8_t twi_writeTo(uint8_t address, uint8_t* data, uint8_t length, uint8_t wait
   }
   else
     // send start condition
-    TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN) | _BV(TWIE) | _BV(TWSTA);	// enable INTs
+    // don't reset int flag, int may already be pending!
+    TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) /*| _BV(TWINT)*/ | _BV(TWSTA);
+
+  sei();
 
   // wait for write operation to complete
-  while(wait && (TWI_MTX == twi_state)){
-    continue;
-  }
-  
+  if(wait)
+    twi_wait(false, TWI_MTX, TRANSMIT_TIMEOUT_US);
+
   if (twi_error == 0xFF)
     return 0;	// success
   else if (twi_error == TW_MT_SLA_NACK)
@@ -332,6 +384,9 @@ void twi_reply(uint8_t ack)
  */
 void twi_stop(void)
 {
+  // update twi state
+  twi_state = TWI_READY;
+
   // send stop condition
   TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT) | _BV(TWSTO);
 
@@ -340,9 +395,6 @@ void twi_stop(void)
   while(TWCR & _BV(TWSTO)){
     continue;
   }
-
-  // update twi state
-  twi_state = TWI_READY;
 }
 
 /* 
@@ -353,11 +405,11 @@ void twi_stop(void)
  */
 void twi_releaseBus(void)
 {
-  // release bus
-  TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT);
-
   // update twi state
   twi_state = TWI_READY;
+
+  // release bus
+  TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT);
 }
 
 ISR(TWI_vect)
@@ -437,10 +489,11 @@ ISR(TWI_vect)
     // TW_MR_ARB_LOST handled by TW_MT_ARB_LOST case
 
     // Slave Receiver
-    case TW_SR_SLA_ACK:   // addressed, returned ack
-    case TW_SR_GCALL_ACK: // addressed generally, returned ack
     case TW_SR_ARB_LOST_SLA_ACK:   // lost arbitration, returned ack
     case TW_SR_ARB_LOST_GCALL_ACK: // lost arbitration, returned ack
+      twi_error = TW_MT_ARB_LOST;
+    case TW_SR_SLA_ACK:   // addressed, returned ack
+    case TW_SR_GCALL_ACK: // addressed generally, returned ack
       // enter slave receiver mode
       twi_state = TWI_SRX;
       // indicate that rx buffer can be overwritten and ack
@@ -464,24 +517,27 @@ ISR(TWI_vect)
       if(twi_rxBufferIndex < TWI_BUFFER_LENGTH){
         twi_rxBuffer[twi_rxBufferIndex] = '\0';
       }
-      // sends ack and stops interface for clock stretching
-      twi_stop();
+      // the transmission has ended and the clock need not to be
+      // stretched at all (and can not) so just release the bus
+      // if then own address will be received the clock will be stretched
+      // until int service is called again and the int flag is cleared so ...
+      // ack future responses and leave slave receiver state
+      twi_releaseBus();
       // callback to user defined callback
       twi_onSlaveReceive(twi_rxBuffer, twi_rxBufferIndex);
       // since we submit rx buffer to "wire" library, we can reset it
       twi_rxBufferIndex = 0;
-      // ack future responses and leave slave receiver state
-      twi_releaseBus();
       break;
     case TW_SR_DATA_NACK:       // data received, returned nack
     case TW_SR_GCALL_DATA_NACK: // data received generally, returned nack
-      // nack back at master
-      twi_reply(0);
+      // ack future responses and leave slave receiver state
+      twi_releaseBus();
       break;
     
     // Slave Transmitter
-    case TW_ST_SLA_ACK:          // addressed, returned ack
     case TW_ST_ARB_LOST_SLA_ACK: // arbitration lost, returned ack
+      twi_error = TW_MT_ARB_LOST;
+    case TW_ST_SLA_ACK:          // addressed, returned ack
       // enter slave transmitter mode
       twi_state = TWI_STX;
       // ready the tx buffer index for iteration
@@ -509,10 +565,8 @@ ISR(TWI_vect)
       break;
     case TW_ST_DATA_NACK: // received nack, we are done 
     case TW_ST_LAST_DATA: // received ack, but we are done already!
-      // ack future responses
-      twi_reply(1);
-      // leave slave receiver state
-      twi_state = TWI_READY;
+      // ack future responses and leave slave receiver state
+      twi_releaseBus();
       break;
 
     // All
